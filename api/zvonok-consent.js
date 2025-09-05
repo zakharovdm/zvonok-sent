@@ -43,13 +43,24 @@ export default async function handler(req, res) {
 
     // 4) Достаём номер из возможных полей
     const candidate =
+      // стандартные поля
       body.phone ||
       body.number ||
-      body.abonent_number ||
       body.client_phone ||
+      body.abonent_number ||
       body.caller ||
       body.to ||
       req.query.phone ||
+      // Zvonok postback/IVR
+      body.ct_phone ||
+      body.ct_phone8 ||
+      body.ct_phone9 ||
+      req.query.ct_phone ||
+      req.query.ct_phone8 ||
+      req.query.ct_phone9 ||
+      // иногда встречается в интеграторах
+      body.from_number ||
+      req.query.from_number ||
       '';
 
     const phone = normalizePhone(candidate, FORCE_COUNTRY_CODE);
@@ -100,7 +111,8 @@ function normalizePhone(input, defaultCountry = '7') {
   const digits = String(input).replace(/[^\d]/g, '');
 
   // Очень простой нормалайзер (под РФ по умолчанию):
-  if (digits.length === 11 && digits.startsWith('8')) return `+7${digits.slice(1)}`;
+  if (digits.length === 11 && digits.startsWith('8'))
+    return `+7${digits.slice(1)}`;
   if (digits.length === 11 && digits.startsWith('7')) return `+${digits}`;
   if (digits.length === 10) return `+${defaultCountry}${digits}`;
 
