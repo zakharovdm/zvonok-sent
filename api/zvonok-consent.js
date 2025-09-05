@@ -27,45 +27,57 @@ export default async function handler(req, res) {
     const raw = await readBody(req);
 
     // 3) Парсим тело: JSON или x-www-form-urlencoded
-    let body = {};
     const ct = (req.headers['content-type'] || '').toLowerCase();
+    let body = {};
     if (ct.includes('application/json')) {
       body = safeJson(raw);
     } else if (ct.includes('application/x-www-form-urlencoded')) {
       body = Object.fromEntries(new URLSearchParams(raw));
     } else {
-      // поддержим text/plain и GET-параметры, на всякий случай
+      // text/plain, multipart/form-data и прочее — оставим как есть
+      // (на multipart всё равно сделаем fallback-поиск телефонов в raw)
       body = safeJson(raw);
-      if (Object.keys(body).length === 0) {
-        body = { ...req.query };
-      }
+      if (Object.keys(body).length === 0) body = { ...req.query };
     }
 
     // 4) Достаём номер из возможных полей
-    const candidate =
-      // стандартные поля
+    let candidate =
       body.phone ||
       body.number ||
       body.client_phone ||
       body.abonent_number ||
       body.caller ||
       body.to ||
-      req.query.phone ||
-      // Zvonok postback/IVR
       body.ct_phone ||
       body.ct_phone8 ||
       body.ct_phone9 ||
+      req.query.phone ||
+      req.query.number ||
+      req.query.client_phone ||
+      req.query.abonent_number ||
+      req.query.caller ||
+      req.query.to ||
       req.query.ct_phone ||
       req.query.ct_phone8 ||
       req.query.ct_phone9 ||
-      // иногда встречается в интеграторах
-      body.from_number ||
-      req.query.from_number ||
       '';
+
+    // 4.1) Если всё ещё пусто — попробуем вытащить из любого поля/сырого тела
+    if (!candidate)
+      candidate =
+        extractPhoneFromAny(body) ||
+        extractPhoneFromAny(req.query) ||
+        extractPhoneFromText(raw);
 
     const phone = normalizePhone(candidate, FORCE_COUNTRY_CODE);
     if (!phone) {
-      return res.status(400).json({ error: 'phone_not_found' });
+      // опционально можно логировать для дебага
+      console.warn('phone_not_found', {
+        query: req.query,
+        ct,
+        raw: raw?.slice?.(0, 512),
+      });
+      return res.status(200).json({ ok: true, skipped: 'phone_not_found' });
     }
 
     // 5) Дергаем SaleBot whatsapp_callback
@@ -130,3 +142,19 @@ async function readBody(req) {
     req.on('error', reject);
   });
 }
+
+function extractPhoneFromAny(obj) {
+  for (const v of Object.values(obj || {})) {
+    if (typeof v === 'string') {
+      const m = v.match(/\+?\d{10,15}/);
+      if (m) return m[0];
+    }
+  }
+  return '';
+}
+
+function extractPhoneFromText(s) {
+  const m = String(s || '').match(/\+?\d{10,15}/);
+  return m ? m[0] : '';
+}
+
