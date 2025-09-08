@@ -1,9 +1,9 @@
 // api/zvonok-consent.js
-// Vercel Node.js Serverless Function
+// Vercel Serverless Function — Zvonok -> Salebot (WhatsApp)
 
 export default async function handler(req, res) {
   try {
-    if (!['POST', 'GET'].includes(req.method)) {
+    if (!['GET', 'POST'].includes(req.method)) {
       return res.status(405).json({ error: 'method_not_allowed' });
     }
 
@@ -13,24 +13,26 @@ export default async function handler(req, res) {
       SALEBOT_WA_BOT_ID,      // ID WA-канала (обязателен для whatsapp_message)
       SALEBOT_BOT_ID,         // опциональный fallback через whatsapp_callback
       DEFAULT_MESSAGE = 'Спасибо за согласие! Пришлю детали вебинара сюда 😊',
-      SALEBOT_MESSAGE_ID,     // дефолтный ID шаблона для WABA
-      SALEBOT_FORCE_TEMPLATE, // '1' → слать шаблон в приоритете
-      FORCE_COUNTRY_CODE = '7',
+      SALEBOT_MESSAGE_ID,     // дефолтный ID шаблона (если есть — попробуем сначала его)
+      FORCE_COUNTRY_CODE = '7'
     } = process.env;
 
     if (!WEBHOOK_TOKEN || !SALEBOT_API_KEY) {
       return res.status(500).json({ error: 'env_missing_base' });
     }
     if (!SALEBOT_WA_BOT_ID && !SALEBOT_BOT_ID) {
-      return res.status(500).json({ error: 'env_missing_channel', hint: 'нужен SALEBOT_WA_BOT_ID или (как запас) SALEBOT_BOT_ID' });
+      return res.status(500).json({
+        error: 'env_missing_channel',
+        hint: 'Нужен SALEBOT_WA_BOT_ID (WA-канал) или хотя бы SALEBOT_BOT_ID (fallback)'
+      });
     }
 
-    // 1) авторизация вебхука
+    // 1) auth токеном
     if ((req.query?.token || '') !== WEBHOOK_TOKEN) {
       return res.status(401).json({ error: 'invalid_token' });
     }
 
-    // 2) прочесть тело и распарсить
+    // 2) прочитать и распарсить тело
     const raw = await readBody(req);
     const ct = (req.headers['content-type'] || '').toLowerCase();
     let body = {};
@@ -43,7 +45,7 @@ export default async function handler(req, res) {
       if (Object.keys(body).length === 0) body = { ...req.query };
     }
 
-    // 3) телефон (ct_* + запасные ключи) и нормализация
+    // 3) достаём телефон из ct_* и др. + нормализация
     let candidate =
       body.phone || body.number || body.client_phone || body.abonent_number ||
       body.caller || body.to || body.ct_phone || body.ct_phone8 || body.ct_phone9 ||
@@ -59,7 +61,7 @@ export default async function handler(req, res) {
     }
     const phone = normalizePhone(candidate, FORCE_COUNTRY_CODE);
 
-    // 3.1) фильтр «нажата 1» — если вебхук повешен широко
+    // 3.1) опционально: пропускаем, если не нажата 1
     const button = (body.ct_button_num ?? req.query.ct_button_num)?.toString();
     if (button && button !== '1') {
       return res.status(200).json({ ok: true, skipped: 'button_not_1' });
@@ -70,71 +72,78 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, skipped: 'phone_not_found' });
     }
 
-    // 4) режим отправки: text / template / both, с оверрайдами из query
+    // 4) оверрайды для теста: ?wa_id, ?mode=text|template, ?template_id, ?msg
     const waId = Number(req.query.wa_id || SALEBOT_WA_BOT_ID || 0);
-    const mode = (req.query.mode || '').toString();            // 'text' | 'template' | ''
-    const msg = (req.query.msg || '').toString() || DEFAULT_MESSAGE;
+    const mode = (req.query.mode || '').toString(); // '', 'text', 'template'
+    const msg  = (req.query.msg || '').toString() || DEFAULT_MESSAGE;
     const templateId = Number(req.query.template_id || SALEBOT_MESSAGE_ID || 0);
 
-    // приоритет шаблона: если явно mode=template ИЛИ SALEBOT_FORCE_TEMPLATE='1' (и не переопределили mode=text)
-    const preferTemplate = mode === 'template' || (SALEBOT_FORCE_TEMPLATE === '1' && mode !== 'text');
-
-    if (!waId && !SALEBOT_BOT_ID) {
-      return res.status(500).json({ error: 'wa_bot_id_missing', hint: 'передай ?wa_id=... или задай SALEBOT_WA_BOT_ID, либо включи fallback SALEBOT_BOT_ID' });
-    }
-
     const attempts = [];
+    const base = `https://chatter.salebot.pro/api/${SALEBOT_API_KEY}`;
 
-    // 5) отправка (сначала шаблон при необходимости)
-    if (waId && preferTemplate && templateId > 0) {
-      const rTpl = await sendWA({ apiKey: SALEBOT_API_KEY, phone, whatsapp_bot_id: waId, message_id: templateId });
-      attempts.push({ via: 'whatsapp_message(template)', status: rTpl.status, body: rTpl.body });
+    // 5) если есть шаблон — пробуем его первым (WABA вне 24ч)
+    if (waId && (mode === 'template' || (mode !== 'text' && templateId > 0))) {
+      const rTpl = await sendWA(base, { phone, whatsapp_bot_id: waId, message_id: templateId });
+      attempts.push({ via: 'whatsapp_message(template)', status: rTpl.status, body: rTpl.body, payload: rTpl.payload });
       if (rTpl.ok) {
+        const hist = await pullHistory(base, phone);
         return res.status(200).json({
           ok: true, sent_to_salebot: phone, wa_bot_id: waId,
-          salebot_via: 'whatsapp_message(template)', salebot_response: rTpl.body
+          salebot_via: 'whatsapp_message(template)', salebot_response: rTpl.body,
+          history: hist
         });
       }
       console.error('whatsapp_message(template) failed', rTpl.status, rTpl.body);
     }
 
+    // 6) затем пробуем обычный текст (или если шаблон не задан)
     if (waId) {
-      const rTxt = await sendWA({ apiKey: SALEBOT_API_KEY, phone, whatsapp_bot_id: waId, text: msg });
-      attempts.push({ via: 'whatsapp_message(text)', status: rTxt.status, body: rTxt.body });
+      const rTxt = await sendWA(base, { phone, whatsapp_bot_id: waId, text: msg });
+      attempts.push({ via: 'whatsapp_message(text)', status: rTxt.status, body: rTxt.body, payload: rTxt.payload });
       if (rTxt.ok) {
+        const hist = await pullHistory(base, phone);
         return res.status(200).json({
           ok: true, sent_to_salebot: phone, wa_bot_id: waId,
-          salebot_via: 'whatsapp_message(text)', text_sent: msg, salebot_response: rTxt.body
+          salebot_via: 'whatsapp_message(text)', text_sent: msg, salebot_response: rTxt.body,
+          history: hist
         });
       }
       console.error('whatsapp_message(text) failed', rTxt.status, rTxt.body);
     }
 
-    // fallback: запуск схемы (на случай, если WA-канал/окно мешают, а логика отправки внутри бота)
+    // 7) fallback — стартуем бота (если настроена логика отправки внутри схемы)
     if (SALEBOT_BOT_ID) {
-      const rCb = await sendCallback({
-        apiKey: SALEBOT_API_KEY,
-        phone, bot_id: Number(SALEBOT_BOT_ID),
-        message: msg, resume_bot: true
+      const rCb = await sendCallback(base, {
+        phone, bot_id: Number(SALEBOT_BOT_ID), message: msg, resume_bot: true
       });
-      attempts.push({ via: 'whatsapp_callback', status: rCb.status, body: rCb.body });
+      attempts.push({ via: 'whatsapp_callback', status: rCb.status, body: rCb.body, payload: rCb.payload });
       if (rCb.ok) {
+        const hist = await pullHistory(base, phone);
         return res.status(200).json({
           ok: true, sent_to_salebot: phone,
-          salebot_via: 'whatsapp_callback', salebot_response: rCb.body
+          salebot_via: 'whatsapp_callback', salebot_response: rCb.body,
+          history: hist
         });
       }
       console.error('whatsapp_callback failed', rCb.status, rCb.body);
     }
 
-    return res.status(502).json({ error: 'salebot_failed', attempts, hint: 'проверь 24h окно WABA, правильность wa_id и template_id' });
+    // если ничего не сработало
+    const hist = await pullHistory(base, phone);
+    return res.status(502).json({
+      error: 'salebot_failed',
+      attempts, history: hist,
+      hint: 'Если WABA и окно 24h закрыто — задай SALEBOT_MESSAGE_ID или передай ?mode=template&template_id=...'
+    });
+
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: 'internal', details: String(e?.message || e) });
   }
 }
 
-/* ---------- helpers ---------- */
+/* ===== helpers ===== */
+
 function safeJson(s){ try { return JSON.parse(s) } catch { return {} } }
 function safeParseJson(s){ try { return JSON.parse(s) } catch { return null } }
 
@@ -170,29 +179,51 @@ function extractPhoneFromText(s){
   return m ? m[0] : '';
 }
 
-/* ---------- SaleBot API ---------- */
-async function sendWA({ apiKey, phone, whatsapp_bot_id, text, message_id }) {
-  const url = `https://chatter.salebot.pro/api/${apiKey}/whatsapp_message`;
-  const payload = { phone, whatsapp_bot_id };
-  if (message_id) payload.message_id = Number(message_id);
-  else payload.text = text;
+/* ===== SaleBot calls ===== */
 
-  const resp = await fetch(url, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload)
+async function sendWA(base, payload) {
+  // для текста передадим и text, и message (некоторые редакции API принимают message)
+  const p = { phone: payload.phone, whatsapp_bot_id: payload.whatsapp_bot_id };
+  if (payload.message_id) p.message_id = Number(payload.message_id);
+  else { p.text = payload.text; p.message = payload.text; }
+
+  const r = await fetch(`${base}/whatsapp_message`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(p),
   });
-  const t = await resp.text();
-  return { ok: resp.ok, status: resp.status, body: safeParseJson(t) ?? t, payloadSent: payload };
+  const t = await r.text();
+  return { ok: r.ok, status: r.status, body: safeParseJson(t) ?? t, payload: p };
 }
 
-async function sendCallback({ apiKey, phone, bot_id, message, resume_bot }) {
-  const url = `https://chatter.salebot.pro/api/${apiKey}/whatsapp_callback`;
-  const payload = {
-    phone, bot_id, message, resume_bot: !!resume_bot,
-    source: 'zvonok-consent', ts: new Date().toISOString()
-  };
-  const resp = await fetch(url, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload)
+async function sendCallback(base, payload) {
+  const r = await fetch(`${base}/whatsapp_callback`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      phone: payload.phone,
+      bot_id: payload.bot_id,
+      message: payload.message,
+      resume_bot: !!payload.resume_bot,
+      source: 'zvonok-consent',
+      ts: new Date().toISOString()
+    })
   });
-  const t = await resp.text();
-  return { ok: resp.ok, status: resp.status, body: safeParseJson(t) ?? t, payloadSent: payload };
+  const t = await r.text();
+  return { ok: r.ok, status: r.status, body: safeParseJson(t) ?? t, payload };
 }
+
+// «консоль-лог» от SaleBot: client_id и последние события в чате
+async function pullHistory(base, phone){
+  try {
+    const cid = await fetch(`${base}/whatsapp_client_id?phone=${encodeURIComponent(phone)}`);
+    const cPack = await packResp(cid);
+    const clientId = cPack?.body?.client_id || cPack?.body?.id || cPack?.body?.clientId;
+    if (!clientId) return { whatsapp_client_id: cPack, get_history: { skipped: 'no_client_id' } };
+    const h = await fetch(`${base}/get_history?client_id=${encodeURIComponent(clientId)}`);
+    return { whatsapp_client_id: cPack, get_history: await packResp(h) };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+async function packResp(r){ const t=await r.text(); return { ok:r.ok, status:r.status, body:safeParseJson(t) ?? t } }
