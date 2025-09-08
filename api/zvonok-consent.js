@@ -31,9 +31,14 @@ export default async function handler(req, res) {
     const raw = await readBody(req);
     const ct = (req.headers['content-type'] || '').toLowerCase();
     let body = {};
-    if (ct.includes('application/json')) body = safeJson(raw);
-    else if (ct.includes('application/x-www-form-urlencoded')) body = Object.fromEntries(new URLSearchParams(raw));
-    else { body = safeJson(raw); if (Object.keys(body).length === 0) body = { ...req.query }; }
+    if (ct.includes('application/json')) {
+      body = safeJson(raw); // всегда {} при ошибке
+    } else if (ct.includes('application/x-www-form-urlencoded')) {
+      body = Object.fromEntries(new URLSearchParams(raw || ''));
+    } else {
+      body = safeJson(raw);
+      if (Object.keys(body).length === 0) body = { ...req.query };
+    }
 
     // 3) достаём телефон (ct_* и запасные ключи) + нормализуем
     let candidate =
@@ -53,21 +58,19 @@ export default async function handler(req, res) {
     }
 
     if (!phone) {
-      console.warn('phone_not_found', { query: req.query, ct, raw: String(raw).slice(0, 300) });
+      console.warn('phone_not_found', { query: req.query, ct, raw: String(raw || '').slice(0, 300) });
       return res.status(200).json({ ok: true, skipped: 'phone_not_found' });
     }
 
-    // 4) запускаем бота (шаблон — в первом блоке; стартовое условие в боте: added_to_list_callback)
+    // 4) запускаем бота (шаблон — в первом блоке; стартовое условие: added_to_list_callback)
     const base = `https://chatter.salebot.pro/api/${SALEBOT_API_KEY}`;
     const payload = {
       phone,
       bot_id: Number(SALEBOT_BOT_ID),
-      // message можно не слать — мы лишь запускаем схему.
       resume_bot: true,
       source: 'zvonok-consent',
       ts: new Date().toISOString(),
-
-      // при желании прокинь доп.поля в карточку клиента:
+      // прокидываем служебные поля — попадут в карточку клиента
       ct_call_id: body.ct_call_id || req.query.ct_call_id || undefined,
       ct_status: body.ct_status || req.query.ct_status || undefined,
       ct_dial_status: body.ct_dial_status || req.query.ct_dial_status || undefined,
@@ -99,7 +102,7 @@ export default async function handler(req, res) {
 }
 
 /* helpers */
-function safeJson(s){ try { return JSON.parse(s) } catch { return null } }
+function safeJson(s){ try { return JSON.parse(s) } catch { return {} } } // ← ключевая правка
 function normalizePhone(input, defaultCountry='7'){
   const d = String(input ?? '').trim().replace(/[^\d]/g,'');
   if (!d) return '';
