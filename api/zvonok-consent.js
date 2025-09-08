@@ -1,5 +1,5 @@
 // api/zvonok-consent.js
-// Variant A: только запуск бота через whatsapp_callback (шаблон уходит из первого блока в конструкторе)
+// Variant A: запускаем бота через whatsapp_callback, первый блок в боте — WhatsApp-шаблон.
 
 export default async function handler(req, res) {
   try {
@@ -10,9 +10,10 @@ export default async function handler(req, res) {
     const {
       WEBHOOK_TOKEN,
       SALEBOT_API_KEY,
-      SALEBOT_BOT_ID,                 // ID бота в конструкторе (обязательно)
+      SALEBOT_BOT_ID,                 // ID бота в конструкторе
       FORCE_COUNTRY_CODE = '7',       // нормализация номера
-      DEFAULT_CALLBACK_MESSAGE = 'added_to_list_callback' // текст-триггер для стартового условия
+      DEFAULT_CALLBACK_MESSAGE = 'added_to_list_callback', // ключ для условия по message
+      DEFAULT_START_SIGNAL   = 'zvonok_consent'            // ключ для условия по start_signal
     } = process.env;
 
     if (!WEBHOOK_TOKEN || !SALEBOT_API_KEY || !SALEBOT_BOT_ID) {
@@ -28,9 +29,9 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: 'invalid_token' });
     }
 
-    // 2) parse body
+    // 2) parse
     const raw = await readBody(req);
-    const ct = (req.headers['content-type'] || '').toLowerCase();
+    const ct  = (req.headers['content-type'] || '').toLowerCase();
     let body = {};
     if (ct.includes('application/json')) {
       body = safeJson(raw);
@@ -63,20 +64,27 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, skipped: 'phone_not_found' });
     }
 
-    // 4) ОБЯЗАТЕЛЬНОЕ сообщение для whatsapp_callback
-    const cbMessage =
-      (req.query.msg || req.query.message || body.msg || body.message || DEFAULT_CALLBACK_MESSAGE).toString();
+    // 4) формируем триггеры запуска
+    const cbMessage = (
+      req.query.msg || req.query.message || body.msg || body.message || DEFAULT_CALLBACK_MESSAGE
+    ).toString();
 
-    // 5) стартуем бота (первый блок — шаблон; стартовое условие в боте: added_to_list_callback)
+    const startSignal = (
+      req.query.start_signal || body.start_signal || DEFAULT_START_SIGNAL
+    ).toString();
+
+    // 5) запускаем бота (первый блок — шаблон; старт по message и/или start_signal)
     const base = `https://chatter.salebot.pro/api/${SALEBOT_API_KEY}`;
     const payload = cleanUndefined({
       phone,
       bot_id: Number(SALEBOT_BOT_ID),
-      message: cbMessage,              // ← ОБЯЗАТЕЛЬНО
+      message: cbMessage,              // для условия "message содержит added_to_list_callback"
       resume_bot: true,
       source: 'zvonok-consent',
       ts: new Date().toISOString(),
-      // полезные поля из Zvonok попадут в карточку клиента
+      // пробрасываем второй флаг, если выберешь условие "start_signal = zvonok_consent"
+      start_signal: startSignal,
+      // служебные поля из Zvonok — в карточку клиента
       ct_call_id: body.ct_call_id || req.query.ct_call_id,
       ct_status: body.ct_status || req.query.ct_status,
       ct_dial_status: body.ct_dial_status || req.query.ct_dial_status,
@@ -99,6 +107,7 @@ export default async function handler(req, res) {
       sent_to_salebot: phone,
       salebot_via: 'whatsapp_callback',
       message_used: cbMessage,
+      start_signal_used: startSignal,
       salebot_response: safeJson(text) || text
     });
 
